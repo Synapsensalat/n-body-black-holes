@@ -24,15 +24,15 @@
     // Configuration / Parameters (easily change these values)
     // ============================================================
     const NEW_BH_RADIUS = 0.01;           // Radius for newly spawned (dynamic) black holes
-    const STATIC_BH_RADIUS = 0.02;         // Radius for the static center black hole
-    const DESIRED_STATIC_STRENGTH = 5;    // Desired lensing strength for the static BH (at STATIC_BH_RADIUS)
+    const STATIC_BH_RADIUS = 0.02;        // Radius for the static center black hole
+    const DESIRED_STATIC_STRENGTH = 5;      // Desired lensing strength for the static BH (at STATIC_BH_RADIUS)
     // Compute lensing factor so that a BH of radius STATIC_BH_RADIUS gets ~DESIRED_STATIC_STRENGTH.
     const lensingFactor = DESIRED_STATIC_STRENGTH / (STATIC_BH_RADIUS * STATIC_BH_RADIUS);
-    const GM = 0.5;                      // Gravitational constant
-    const epsilon = 0.00001;             // Softening factor
-    const PREDICTION_STEPS = 5000;         // Number of simulation steps for prediction
-    const PREDICTION_DT = 0.02;            // Time delta per prediction step
-    const MAX_BLACK_HOLES = 100;           // Maximum number of black holes (shader array size)
+    const GM = 0.5;                     // Gravitational constant
+    const epsilon = 0.00001;            // Softening factor
+    const PREDICTION_STEPS = 5000;      // Number of simulation steps for prediction
+    const PREDICTION_DT = 0.02;         // Time delta per prediction step
+    const MAX_BLACK_HOLES = 100;        // Maximum number of black holes (shader array size)
 
     // ============================================================
     // Shader Code
@@ -168,12 +168,8 @@
     });
 
     // ============================================================
-    // Input Handling
+    // Input Handling Helpers
     // ============================================================
-    let isDragging = false;
-    let dragStart = null;   // In simulation space.
-    let dragCurrent = null; // In screen space.
-
     function screenToSimulation(x, y) {
       if (!Number.isFinite(x) || !Number.isFinite(y)) {
         console.warn('Invalid coordinates:', x, y);
@@ -194,37 +190,82 @@
     }
 
     // ============================================================
-    // Predicted Orbit Simulation
+    // Improved Predicted Orbit Simulation (with RK4 for the predicted object)
     // ============================================================
-    // A collision is predicted if the predicted position is within (bh.radius + NEW_BH_RADIUS) of any BH.
-    function simulatePredictedOrbit(initialPos, initialVel, steps = PREDICTION_STEPS, dt = PREDICTION_DT, simBHs = blackHoles.slice()) {
+    function simulatePredictedOrbit(initialPos, initialVel, steps = PREDICTION_STEPS, dt = PREDICTION_DT, currentBHs) {
       try {
+        // Create a deep copy of the current black holes for simulation
+        const simBHs = currentBHs.map(bh => ({
+          pos: bh.pos.clone(),
+          vel: bh.vel.clone(),
+          radius: bh.radius,
+          strength: bh.strength,
+          static: bh.static
+        }));
+    
         let simPos = initialPos.clone();
         let simVel = initialVel.clone();
         const positions = [];
+    
+        // Helper function: compute gravitational acceleration at a point from all black holes
+        function computeAcceleration(pos) {
+          let acc = new THREE.Vector2(0, 0);
+          for (const bh of simBHs) {
+            const delta = pos.clone().sub(bh.pos);
+            const dist = delta.length();
+            const mass = bh.radius * bh.radius;
+            acc.add(delta.normalize().multiplyScalar(-GM * mass / (dist * dist + epsilon)));
+          }
+          return acc;
+        }
+    
         for (let i = 0; i < steps; i++) {
+          // Check for collision: if predicted position comes within (bh.radius + NEW_BH_RADIUS) of any BH
           let collision = false;
-          for (let j = 0; j < simBHs.length; j++) {
-            const bh = simBHs[j];
+          for (const bh of simBHs) {
             if (simPos.distanceTo(bh.pos) < (bh.radius + NEW_BH_RADIUS)) {
               collision = true;
               break;
             }
           }
           positions.push(simPos.clone());
-          if (collision) {
-            break;
+          if (collision) break;
+    
+          // Update dynamic black holes (using simple Euler integration)
+          for (const bh of simBHs) {
+            if (bh.static) continue;
+            let bhAcc = new THREE.Vector2(0, 0);
+            for (const other of simBHs) {
+              if (bh === other) continue;
+              const delta = bh.pos.clone().sub(other.pos);
+              const dist = delta.length();
+              const otherMass = other.radius * other.radius;
+              bhAcc.add(delta.normalize().multiplyScalar(-GM * otherMass / (dist * dist + epsilon)));
+            }
+            bh.vel.add(bhAcc.multiplyScalar(dt));
+            bh.pos.add(bh.vel.clone().multiplyScalar(dt));
           }
-          let acc = new THREE.Vector2(0, 0);
-          for (let j = 0; j < simBHs.length; j++) {
-            const bh = simBHs[j];
-            const delta = simPos.clone().sub(bh.pos);
-            const dist = delta.length();
-            const mass = bh.radius * bh.radius;
-            acc.add(delta.normalize().multiplyScalar(-GM * mass / (dist * dist + epsilon)));
-          }
-          simVel.add(acc.multiplyScalar(dt));
-          simPos.add(simVel.clone().multiplyScalar(dt));
+    
+          // Now update the predicted object using full RK4 integration:
+          // k1
+          const k1p = simVel.clone();
+          const k1v = computeAcceleration(simPos);
+          // k2
+          const k2p = simVel.clone().add(k1v.clone().multiplyScalar(dt / 2));
+          const k2v = computeAcceleration(simPos.clone().add(k1p.clone().multiplyScalar(dt / 2)));
+          // k3
+          const k3p = simVel.clone().add(k2v.clone().multiplyScalar(dt / 2));
+          const k3v = computeAcceleration(simPos.clone().add(k2p.clone().multiplyScalar(dt / 2)));
+          // k4
+          const k4p = simVel.clone().add(k3v.clone().multiplyScalar(dt));
+          const k4v = computeAcceleration(simPos.clone().add(k3p.clone().multiplyScalar(dt)));
+    
+          // Combine increments
+          const dp = k1p.clone().add(k2p.clone().multiplyScalar(2)).add(k3p.clone().multiplyScalar(2)).add(k4p).multiplyScalar(dt / 6);
+          const dv = k1v.clone().add(k2v.clone().multiplyScalar(2)).add(k3v.clone().multiplyScalar(2)).add(k4v).multiplyScalar(dt / 6);
+    
+          simPos.add(dp);
+          simVel.add(dv);
         }
         return positions;
       } catch (error) {
@@ -236,6 +277,10 @@
     // ============================================================
     // Input Event Handlers
     // ============================================================
+    let isDragging = false;
+    let dragStart = null;   // In simulation space.
+    let dragCurrent = null; // In screen space.
+
     function handleStart(x, y) {
       dragStart = screenToSimulation(x, y);
       isDragging = true;
@@ -253,6 +298,7 @@
       const velocityFactor = 0.5;
       const launchVector = dragStart.clone().sub(currentSim);
       const initialVel = launchVector.clone().multiplyScalar(velocityFactor);
+      // Use the improved RK4 prediction (simulatePredictedOrbit now expects a BH array)
       const predictedPositions = simulatePredictedOrbit(dragStart, initialVel, PREDICTION_STEPS, PREDICTION_DT, blackHoles.slice());
       if (predictedPositions.length < 2) {
         predictedOrbitLine.visible = false;
