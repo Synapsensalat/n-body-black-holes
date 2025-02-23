@@ -125,7 +125,7 @@
     scene.add(plane);
 
     // Predicted orbit indicator line (green)
-    const orbitLineMaterial = new THREE.LineBasicMaterial({ color: 0x00ff00, depthTest: false });
+    const orbitLineMaterial = new THREE.LineBasicMaterial({ color: 0x00ff00, depthTest: false, linewidth: 3});
     const orbitLineGeometry = new THREE.BufferGeometry();
     const initialPoints = new Float32Array(3);
     orbitLineGeometry.setAttribute('position', new THREE.BufferAttribute(initialPoints, 3));
