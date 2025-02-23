@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Black Hole Simulation – Configurable Parameters</title>
+  <style>
+    body {
+      margin: 0;
+      overflow: hidden;
+      background: #000;
+      touch-action: none;
+    }
+    canvas {
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <script type="module">
+    import * as THREE from 'https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.module.js';
+
+    // ============================================================
+    // Configuration / Parameters (easily change these values)
+    // ============================================================
+    const NEW_BH_RADIUS = 0.01;           // Radius for newly spawned (dynamic) black holes
+    const STATIC_BH_RADIUS = 0.02;         // Radius for the static center black hole
+    const DESIRED_STATIC_STRENGTH = 5;    // Desired lensing strength for the static BH (at STATIC_BH_RADIUS)
+    // Compute lensing factor so that a BH of radius STATIC_BH_RADIUS gets ~DESIRED_STATIC_STRENGTH.
+    const lensingFactor = DESIRED_STATIC_STRENGTH / (STATIC_BH_RADIUS * STATIC_BH_RADIUS);
+    const GM = 0.5;                      // Gravitational constant
+    const epsilon = 0.00001;             // Softening factor
+    const PREDICTION_STEPS = 5000;         // Number of simulation steps for prediction
+    const PREDICTION_DT = 0.02;            // Time delta per prediction step
+    const MAX_BLACK_HOLES = 100;           // Maximum number of black holes (shader array size)
+
+    // ============================================================
+    // Shader Code
+    // ============================================================
+    const vertexShader = `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `;
+
+    function createFragmentShader(width, height) {
+      const aspect = width / height;
+      return `
+        #define MAX_BLACK_HOLES ${MAX_BLACK_HOLES}
+        uniform sampler2D tDiffuse;
+        uniform int numBlackHoles;
+        uniform vec2 blackHolePositions[MAX_BLACK_HOLES];
+        uniform float blackHoleStrengths[MAX_BLACK_HOLES];
+        uniform float blackHoleRadii[MAX_BLACK_HOLES];
+        varying vec2 vUv;
+        const float margin = 0.002;
+        
+        vec2 computeOffset(vec2 uv, vec2 center, float strength, float radius) {
+          vec2 pos = uv - center;
+          pos.x *= ${aspect.toFixed(8)};
+          float dist = length(pos);
+          float safeDist = max(dist - radius, 0.001);
+          float transitionZone = smoothstep(0.0, 0.01, safeDist);
+          float baseDistortion = strength * 0.001 * exp(-safeDist * 5.0) / safeDist;
+          float distortionFactor = transitionZone * (1.0 - exp(-safeDist * 15.0));
+          float finalDistortion = min(baseDistortion * distortionFactor, 0.15);
+          vec2 normalizedPos = pos / dist;
+          normalizedPos.x /= ${aspect.toFixed(8)};
+          return normalizedPos * finalDistortion;
+        }
+        
+        void main() {
+          vec2 totalOffset = vec2(0.0);
+          float smoothEdgeCombined = 1.0;
+          for (int i = 0; i < MAX_BLACK_HOLES; i++) {
+            if(i < numBlackHoles) {
+              vec2 pos = vUv - blackHolePositions[i];
+              pos.x *= ${aspect.toFixed(8)};
+              float dist = length(pos);
+              if(dist < blackHoleRadii[i] - margin) {
+                gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+                return;
+              }
+              totalOffset += computeOffset(vUv, blackHolePositions[i], blackHoleStrengths[i], blackHoleRadii[i]);
+              smoothEdgeCombined *= smoothstep(blackHoleRadii[i] - margin, blackHoleRadii[i] + margin, dist);
+            }
+          }
+          vec2 distortedUv = clamp(vUv - totalOffset, vec2(0.0), vec2(1.0));
+          vec4 distortedColor = texture2D(tDiffuse, distortedUv);
+          gl_FragColor = mix(vec4(0.0), distortedColor, smoothEdgeCombined);
+        }
+      `;
+    }
+
+    // ============================================================
+    // Three.js Setup
+    // ============================================================
+    const scene = new THREE.Scene();
+    const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    document.body.appendChild(renderer.domElement);
+    
+    const geometry = new THREE.PlaneGeometry(2, 2);
+    const texture = new THREE.TextureLoader().load('space.jpg');
+    texture.minFilter = THREE.LinearFilter;
+    texture.magFilter = THREE.LinearFilter;
+
+    let uniforms = {
+      tDiffuse: { value: texture },
+      numBlackHoles: { value: 0 },
+      blackHolePositions: { value: new Array(MAX_BLACK_HOLES).fill().map(() => new THREE.Vector2(0.5, 0.5)) },
+      blackHoleStrengths: { value: new Array(MAX_BLACK_HOLES).fill(lensingFactor * (NEW_BH_RADIUS * NEW_BH_RADIUS)) },
+      blackHoleRadii: { value: new Array(MAX_BLACK_HOLES).fill(NEW_BH_RADIUS) }
+    };
+
+    let material = new THREE.ShaderMaterial({
+      uniforms: uniforms,
+      vertexShader: vertexShader,
+      fragmentShader: createFragmentShader(window.innerWidth, window.innerHeight)
+    });
+
+    const plane = new THREE.Mesh(geometry, material);
+    scene.add(plane);
+
+    // Predicted orbit indicator line (green)
+    const orbitLineMaterial = new THREE.LineBasicMaterial({ color: 0x00ff00, depthTest: false });
+    const orbitLineGeometry = new THREE.BufferGeometry();
+    const initialPoints = new Float32Array(3);
+    orbitLineGeometry.setAttribute('position', new THREE.BufferAttribute(initialPoints, 3));
+    const predictedOrbitLine = new THREE.Line(orbitLineGeometry, orbitLineMaterial);
+    predictedOrbitLine.renderOrder = 999;
+    scene.add(predictedOrbitLine);
+    predictedOrbitLine.visible = false;
+
+    // ============================================================
+    // Resize Handling
+    // ============================================================
+    function resize() {
+      const width = window.innerWidth;
+      const height = window.innerHeight;
+      renderer.setSize(width, height);
+      const newMaterial = new THREE.ShaderMaterial({
+        uniforms: uniforms,
+        vertexShader: vertexShader,
+        fragmentShader: createFragmentShader(width, height)
+      });
+      plane.material = newMaterial;
+      material = newMaterial;
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    // ============================================================
+    // Simulation Setup
+    // ============================================================
+    // In simulation space, (0,0) maps to UV (0.5,0.5).
+    // Each black hole: { pos: Vector2, vel: Vector2, radius: float, strength: float, static?: boolean }
+    const blackHoles = [];
+    // Add a static center black hole.
+    blackHoles.push({
+      pos: new THREE.Vector2(0, 0),
+      vel: new THREE.Vector2(0, 0),
+      radius: STATIC_BH_RADIUS,
+      strength: lensingFactor * (STATIC_BH_RADIUS * STATIC_BH_RADIUS),
+      static: true
+    });
+
+    // ============================================================
+    // Input Handling
+    // ============================================================
+    let isDragging = false;
+    let dragStart = null;   // In simulation space.
+    let dragCurrent = null; // In screen space.
+
+    function screenToSimulation(x, y) {
+      if (!Number.isFinite(x) || !Number.isFinite(y)) {
+        console.warn('Invalid coordinates:', x, y);
+        return new THREE.Vector2(0, 0);
+      }
+      const uv = new THREE.Vector2(x / window.innerWidth, 1 - y / window.innerHeight);
+      const origin = new THREE.Vector2(0.5, 0.5);
+      const aspect = window.innerWidth / window.innerHeight;
+      return new THREE.Vector2((uv.x - origin.x) * aspect, uv.y - origin.y);
+    }
+    function simulationToUV(sim) {
+      const aspect = window.innerWidth / window.innerHeight;
+      const origin = new THREE.Vector2(0.5, 0.5);
+      return new THREE.Vector2(sim.x / aspect + origin.x, sim.y + origin.y);
+    }
+    function uvToNDC(uv) {
+      return new THREE.Vector3(uv.x * 2 - 1, uv.y * 2 - 1, 0);
+    }
+
+    // ============================================================
+    // Predicted Orbit Simulation
+    // ============================================================
+    // A collision is predicted if the predicted position is within (bh.radius + NEW_BH_RADIUS) of any BH.
+    function simulatePredictedOrbit(initialPos, initialVel, steps = PREDICTION_STEPS, dt = PREDICTION_DT, simBHs = blackHoles.slice()) {
+      try {
+        let simPos = initialPos.clone();
+        let simVel = initialVel.clone();
+        const positions = [];
+        for (let i = 0; i < steps; i++) {
+          let collision = false;
+          for (let j = 0; j < simBHs.length; j++) {
+            const bh = simBHs[j];
+            if (simPos.distanceTo(bh.pos) < (bh.radius + NEW_BH_RADIUS)) {
+              collision = true;
+              break;
+            }
+          }
+          positions.push(simPos.clone());
+          if (collision) {
+            break;
+          }
+          let acc = new THREE.Vector2(0, 0);
+          for (let j = 0; j < simBHs.length; j++) {
+            const bh = simBHs[j];
+            const delta = simPos.clone().sub(bh.pos);
+            const dist = delta.length();
+            const mass = bh.radius * bh.radius;
+            acc.add(delta.normalize().multiplyScalar(-GM * mass / (dist * dist + epsilon)));
+          }
+          simVel.add(acc.multiplyScalar(dt));
+          simPos.add(simVel.clone().multiplyScalar(dt));
+        }
+        return positions;
+      } catch (error) {
+        console.error('Error in orbit prediction:', error);
+        return [];
+      }
+    }
+
+    // ============================================================
+    // Input Event Handlers
+    // ============================================================
+    function handleStart(x, y) {
+      dragStart = screenToSimulation(x, y);
+      isDragging = true;
+      dragCurrent = { x, y };
+      if (!predictedOrbitLine.geometry.attributes.position) {
+        const initialPoints = new Float32Array(3);
+        predictedOrbitLine.geometry.setAttribute('position', new THREE.BufferAttribute(initialPoints, 3));
+      }
+      predictedOrbitLine.visible = true;
+    }
+    function handleMove(x, y) {
+      if (!isDragging) return;
+      dragCurrent = { x, y };
+      const currentSim = screenToSimulation(x, y);
+      const velocityFactor = 0.5;
+      const launchVector = dragStart.clone().sub(currentSim);
+      const initialVel = launchVector.clone().multiplyScalar(velocityFactor);
+      const predictedPositions = simulatePredictedOrbit(dragStart, initialVel, PREDICTION_STEPS, PREDICTION_DT, blackHoles.slice());
+      if (predictedPositions.length < 2) {
+        predictedOrbitLine.visible = false;
+        return;
+      }
+      const ndcPoints = [];
+      for (let pos of predictedPositions) {
+        const uv = simulationToUV(pos);
+        ndcPoints.push(uvToNDC(uv));
+      }
+      const positionsArray = new Float32Array(ndcPoints.length * 3);
+      for (let i = 0; i < ndcPoints.length; i++) {
+        positionsArray[i * 3 + 0] = ndcPoints[i].x;
+        positionsArray[i * 3 + 1] = ndcPoints[i].y;
+        positionsArray[i * 3 + 2] = ndcPoints[i].z;
+      }
+      predictedOrbitLine.geometry.setAttribute('position', new THREE.BufferAttribute(positionsArray, 3));
+      predictedOrbitLine.geometry.attributes.position.needsUpdate = true;
+      predictedOrbitLine.visible = true;
+    }
+    function handleEnd(x, y) {
+      if (!isDragging) return;
+      const simEnd = screenToSimulation(x, y);
+      const launchVector = dragStart.clone().sub(simEnd);
+      const velocityFactor = 0.5;
+      const initialVel = launchVector.multiplyScalar(velocityFactor);
+      blackHoles.push({
+        pos: dragStart.clone(),
+        vel: initialVel.clone(),
+        radius: NEW_BH_RADIUS,
+        strength: lensingFactor * (NEW_BH_RADIUS * NEW_BH_RADIUS),
+        static: false
+      });
+      isDragging = false;
+      dragStart = null;
+      dragCurrent = null;
+      predictedOrbitLine.visible = false;
+    }
+
+    renderer.domElement.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      handleStart(e.clientX, e.clientY);
+    });
+    renderer.domElement.addEventListener('mousemove', (e) => {
+      e.preventDefault();
+      handleMove(e.clientX, e.clientY);
+    });
+    renderer.domElement.addEventListener('mouseup', (e) => {
+      e.preventDefault();
+      handleEnd(e.clientX, e.clientY);
+    });
+    renderer.domElement.addEventListener('touchstart', (e) => {
+      e.preventDefault();
+      const touch = e.touches[0];
+      handleStart(touch.clientX, touch.clientY);
+    });
+    renderer.domElement.addEventListener('touchmove', (e) => {
+      e.preventDefault();
+      const touch = e.touches[0];
+      handleMove(touch.clientX, touch.clientY);
+    });
+    renderer.domElement.addEventListener('touchend', (e) => {
+      e.preventDefault();
+      const touch = e.changedTouches[0];
+      handleEnd(touch.clientX, touch.clientY);
+    });
+
+    // ============================================================
+    // Merging Functions
+    // ============================================================
+    // Use the actual collision condition (distance < sum of radii) for merging.
+    // If either BH is static, the merged result remains static at (0,0) with zero velocity.
+    function mergeBlackHoles(bh1, bh2) {
+      const m1 = bh1.radius * bh1.radius;
+      const m2 = bh2.radius * bh2.radius;
+      const totalMass = m1 + m2;
+      let newPos, newVel, isStatic;
+      if (bh1.static || bh2.static) {
+        newPos = new THREE.Vector2(0, 0);
+        newVel = new THREE.Vector2(0, 0);
+        isStatic = true;
+      } else {
+        newPos = bh1.pos.clone().multiplyScalar(m1).add(bh2.pos.clone().multiplyScalar(m2)).divideScalar(totalMass);
+        newVel = bh1.vel.clone().multiplyScalar(m1).add(bh2.vel.clone().multiplyScalar(m2)).divideScalar(totalMass);
+        isStatic = false;
+      }
+      const newRadius = Math.sqrt(bh1.radius * bh1.radius + bh2.radius * bh2.radius);
+      return { pos: newPos, vel: newVel, radius: newRadius, strength: lensingFactor * (newRadius * newRadius), static: isStatic };
+    }
+
+    // ============================================================
+    // Animation & Simulation Loop
+    // ============================================================
+    const clock = new THREE.Clock();
+    function animate() {
+      requestAnimationFrame(animate);
+      const dt = clock.getDelta();
+      const aspect = window.innerWidth / window.innerHeight;
+      
+      // Update dynamic black holes.
+      for (let i = 0; i < blackHoles.length; i++) {
+        const bh = blackHoles[i];
+        if (bh.static) continue;
+        let acc = new THREE.Vector2(0, 0);
+        for (let j = 0; j < blackHoles.length; j++) {
+          if (i === j) continue;
+          const other = blackHoles[j];
+          const delta = bh.pos.clone().sub(other.pos);
+          const dist = delta.length();
+          const otherMass = other.radius * other.radius;
+          acc.add(delta.normalize().multiplyScalar(-GM * otherMass / (dist * dist + epsilon)));
+        }
+        bh.vel.add(acc.multiplyScalar(dt));
+        bh.pos.add(bh.vel.clone().multiplyScalar(dt));
+      }
+      
+      // Merge overlapping black holes.
+      for (let i = blackHoles.length - 1; i >= 0; i--) {
+        for (let j = i - 1; j >= 0; j--) {
+          const delta = blackHoles[i].pos.clone().sub(blackHoles[j].pos);
+          if (delta.length() < (blackHoles[i].radius + blackHoles[j].radius)) {
+            const merged = mergeBlackHoles(blackHoles[i], blackHoles[j]);
+            blackHoles[j] = merged;
+            blackHoles.splice(i, 1);
+            break;
+          }
+        }
+      }
+      
+      // Update shader uniforms.
+      uniforms.numBlackHoles.value = blackHoles.length;
+      let posArray = [];
+      let strengthArray = [];
+      let radiusArray = [];
+      for (let i = 0; i < MAX_BLACK_HOLES; i++) {
+        if (i < blackHoles.length) {
+          const uvPos = simulationToUV(blackHoles[i].pos);
+          posArray.push(uvPos);
+          strengthArray.push(lensingFactor * (blackHoles[i].radius * blackHoles[i].radius));
+          radiusArray.push(blackHoles[i].radius);
+        } else {
+          posArray.push(new THREE.Vector2(0.5, 0.5));
+          strengthArray.push(0.0);
+          radiusArray.push(0.0);
+        }
+      }
+      uniforms.blackHolePositions.value = posArray;
+      uniforms.blackHoleStrengths.value = strengthArray;
+      uniforms.blackHoleRadii.value = radiusArray;
+      
+      renderer.render(scene, camera);
+    }
+    animate();
+  </script>
+</body>
+</html>
